@@ -851,11 +851,11 @@ func (s *Server) Register(stream tpb.Tunnel_RegisterServer) error {
 			s.newClientSession(ctx, reg.GetSession(), p.Addr, rs)
 		case *tpb.RegisterOp_Target:
 			if err := s.handleTarget(p.Addr, reg.GetTarget()); err != nil {
-				s.sendError(fmt.Errorf("failed to handle target resigtration: %v", err))
+				s.sendError(fmt.Errorf("client %s: failed to handle target registration: %v", p.Addr, err))
 			}
 		case *tpb.RegisterOp_Subscription:
 			if err := s.handleSubscription(p.Addr, reg.GetSubscription()); err != nil {
-				s.sendError(fmt.Errorf("failed to handle subscription resigtration: %v", err))
+				s.sendError(fmt.Errorf("client %s: failed to handle subscription registration: %v", p.Addr, err))
 			}
 		default:
 			s.sendError(fmt.Errorf("unknown registration op from %s: %s", p.Addr, reg.Registration))
