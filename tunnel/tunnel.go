@@ -218,6 +218,19 @@ type ServerConfig struct {
 	RegisterHandler     ServerRegHandlerFunc
 	Handler             ServerHandlerFunc
 	LocalTargets        []Target
+
+	// PrivilegeNewestRegistration changes how a duplicate target-name
+	// registration is resolved. By default (false) a target already registered
+	// by another client is rejected — correct when target-names are globally
+	// unique, but it wedges recovery if the previous client's Register stream is
+	// a half-open zombie (e.g. a device reloaded and the FIN never arrived): the
+	// stale entry blocks the device from re-registering until the server
+	// restarts. When true, a same-name registration from a different client
+	// evicts the stale owner (transferring ownership and tearing down the old
+	// target's handler state) and accepts the new one, so a reconnecting client
+	// always wins. Target teardown is made owner-aware, so the evicted client's
+	// later cleanup cannot clobber the new registration.
+	PrivilegeNewestRegistration bool
 }
 
 func (s *Server) bridgeRegHandler(ss ServerSession) error {
@@ -390,29 +403,49 @@ func errorTargetRegisterOp(id, typ, err string) *tpb.RegisterOp {
 	return &tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{Target: id, TargetType: typ, Error: err}}}
 }
 
-// addTargetToMap adds a target to the targets map.
-func (s *Server) addTargetToMap(addr net.Addr, t Target) error {
+// addTargetToMap adds a target to the targets map. If the target is already
+// owned by a different client and PrivilegeNewestRegistration is set, ownership
+// is transferred to addr and the evicted previous owner is returned so the
+// caller can tear down its stale registration; otherwise a duplicate is
+// rejected as before. evicted is nil for a clean add.
+func (s *Server) addTargetToMap(addr net.Addr, t Target) (evicted net.Addr, err error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
 	if c, ok := s.rTargets[t]; ok {
-		return fmt.Errorf("target %q already registered for client %q", t.ID, c)
+		if c == addr || !s.sc.PrivilegeNewestRegistration {
+			return nil, fmt.Errorf("target %q already registered for client %q", t.ID, c)
+		}
+		// Privilege the newest registration: take ownership from the stale
+		// client and report it so the caller can evict it.
+		s.rTargets[t] = addr
+		return c, nil
 	}
 	s.rTargets[t] = addr
-	return nil
+	return nil, nil
 }
 
-// deleteTargetFromMap deletes a target from the targets map.
-func (s *Server) deleteTargetFromMap(t Target) error {
+// deleteTargetFromMap deletes a target from the targets map, but only if it is
+// still owned by addr. It reports whether addr owned the target: ownership can
+// have moved to a newer client (see PrivilegeNewestRegistration), and a stale
+// owner's later cleanup must neither delete the map entry nor tear down the
+// target's handler state, or it would clobber the current registration — so a
+// non-owner delete is a no-op that returns owned=false.
+func (s *Server) deleteTargetFromMap(addr net.Addr, t Target) (owned bool, err error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	if c, ok := s.rTargets[t]; !ok {
-		return fmt.Errorf("target %q is not registered for client %q", t.ID, c)
+	c, ok := s.rTargets[t]
+	if !ok {
+		return false, fmt.Errorf("target %q is not registered for client %q", t.ID, c)
+	}
+	if c != addr {
+		// Target has been re-homed to a newer client; leave it intact.
+		return false, nil
 	}
 
 	delete(s.rTargets, t)
-	return nil
+	return true, nil
 }
 
 // addTargetToClient adds a target to the clients map.
@@ -458,11 +491,30 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		return err
 	}
 
-	if err := s.addTargetToMap(addr, t); err != nil {
+	evicted, err := s.addTargetToMap(addr, t)
+	if err != nil {
 		if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 			return fmt.Errorf("failed to send session error: %v", err)
 		}
 		return err
+	}
+	if evicted != nil {
+		// PrivilegeNewestRegistration: this target was still owned by another
+		// client whose registration is stale (e.g. a half-open Register stream
+		// left by a device reload). Ownership has already transferred to addr;
+		// drop the target from the stale client and tear down its handler-side
+		// session before standing up the new one, so the new registration is not
+		// shadowed by the old target's lingering session. We never touch the
+		// stale client's Register stream — it may be a blocked zombie — so its
+		// own deferred cleanup runs later and finds the target already gone
+		// (and, being a non-owner by then, a no-op via deleteTargetFromMap).
+		s.deleteTargetFromClient(evicted, t)
+		if s.sc.DeleteTargetHandler != nil {
+			if err := s.sc.DeleteTargetHandler(t); err != nil {
+				s.sendError(fmt.Errorf("evicting target %q held by stale client %q: delete handler failed: %v", t.ID, evicted, err))
+			}
+		}
+		s.sendError(fmt.Errorf("target %q re-registered by %q evicted stale registration held by %q", t.ID, addr, evicted))
 	}
 
 	s.addTargetToClient(addr, t)
@@ -687,7 +739,8 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 		return err
 	}
 
-	if err := s.deleteTargetFromMap(t); err != nil {
+	owned, err := s.deleteTargetFromMap(addr, t)
+	if err != nil {
 		if ack {
 			if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 				return fmt.Errorf("failed to send session error: %v", err)
@@ -707,14 +760,21 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 		}
 	}
 
-	if s.sc.DeleteTargetHandler != nil {
+	// Tear down the target-global state (delete handler, subscriber updates)
+	// only if this client still owned the target. If ownership was re-homed to a
+	// newer client (PrivilegeNewestRegistration), the new owner is responsible
+	// for t — running the handler here would clobber its session. The client's
+	// own bookkeeping (target set, subscriber entry) is always cleaned up.
+	if owned && s.sc.DeleteTargetHandler != nil {
 		if err := s.sc.DeleteTargetHandler(t); err != nil {
 			return fmt.Errorf("error calling target deletion handler client: %v", err)
 		}
 	}
 	s.deleteSubscriber(addr, "")
-	if err := s.sendUpdates(t, false); err != nil {
-		return fmt.Errorf("failed to send target subscription updates: %v", err)
+	if owned {
+		if err := s.sendUpdates(t, false); err != nil {
+			return fmt.Errorf("failed to send target subscription updates: %v", err)
+		}
 	}
 
 	return nil

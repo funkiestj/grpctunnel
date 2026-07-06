@@ -637,6 +637,115 @@ func TestServerClient(t *testing.T) {
 	})
 }
 
+func TestPrivilegeNewestRegistration(t *testing.T) {
+	addrA, err := net.ResolveTCPAddr("tcp", "127.0.0.1:45001")
+	if err != nil {
+		t.Fatalf("resolve A: %v", err)
+	}
+	addrB, err := net.ResolveTCPAddr("tcp", "127.0.0.1:45002")
+	if err != nil {
+		t.Fatalf("resolve B: %v", err)
+	}
+	tgt := &tpb.Target{Target: "dev1", TargetType: "GNMI_GNOI", Op: tpb.Target_ADD}
+	key := Target{ID: "dev1", Type: "GNMI_GNOI"}
+
+	// newServer returns a server whose add/delete target handlers append a
+	// trace to *events, so tests can assert the exact handler call sequence.
+	newServer := func(privilege bool) (*Server, *[]string) {
+		var events []string
+		s, err := NewServer(ServerConfig{
+			PrivilegeNewestRegistration: privilege,
+			AddTargetHandler:            func(tt Target) error { events = append(events, "add:"+tt.ID); return nil },
+			DeleteTargetHandler:         func(tt Target) error { events = append(events, "del:"+tt.ID); return nil },
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		return s, &events
+	}
+	addClient := func(s *Server, addr net.Addr) {
+		if err := s.addClient(addr, &regSafeStream{regStream: &registerTestStream{maxSends: 1000}}); err != nil {
+			t.Fatalf("addClient(%v): %v", addr, err)
+		}
+	}
+
+	t.Run("DefaultRejectsDuplicate", func(t *testing.T) {
+		s, events := newServer(false)
+		addClient(s, addrA)
+		addClient(s, addrB)
+		if err := s.addTarget(addrA, tgt); err != nil {
+			t.Fatalf("addTarget(A): %v", err)
+		}
+		if err := s.addTarget(addrB, tgt); err == nil {
+			t.Fatalf("addTarget(B) got success, want duplicate rejection")
+		}
+		if got := s.clientFromTarget(key); got != net.Addr(addrA) {
+			t.Errorf("owner = %v, want A (%v)", got, addrA)
+		}
+		if _, ok := s.clientTargets(addrB)[key]; ok {
+			t.Errorf("B must not own the target after rejection")
+		}
+		if got, want := fmt.Sprint(*events), fmt.Sprint([]string{"add:dev1"}); got != want {
+			t.Errorf("events = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("PrivilegeNewestEvicts", func(t *testing.T) {
+		s, events := newServer(true)
+		addClient(s, addrA)
+		addClient(s, addrB)
+		if err := s.addTarget(addrA, tgt); err != nil {
+			t.Fatalf("addTarget(A): %v", err)
+		}
+		if err := s.addTarget(addrB, tgt); err != nil {
+			t.Fatalf("addTarget(B) got %v, want eviction success", err)
+		}
+		if got := s.clientFromTarget(key); got != net.Addr(addrB) {
+			t.Errorf("owner = %v, want B (%v)", got, addrB)
+		}
+		if _, ok := s.clientTargets(addrA)[key]; ok {
+			t.Errorf("A must no longer own the target after eviction")
+		}
+		if _, ok := s.clientTargets(addrB)[key]; !ok {
+			t.Errorf("B must own the target after eviction")
+		}
+		// add(A), then on eviction the old session is torn down (del) before the
+		// new one is stood up (add): the new registration is last, so it wins.
+		if got, want := fmt.Sprint(*events), fmt.Sprint([]string{"add:dev1", "del:dev1", "add:dev1"}); got != want {
+			t.Errorf("events = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("StaleOwnerCleanupDoesNotClobber", func(t *testing.T) {
+		s, events := newServer(true)
+		addClient(s, addrA)
+		addClient(s, addrB)
+		if err := s.addTarget(addrA, tgt); err != nil {
+			t.Fatalf("addTarget(A): %v", err)
+		}
+		if err := s.addTarget(addrB, tgt); err != nil {
+			t.Fatalf("addTarget(B): %v", err)
+		}
+		*events = (*events)[:0]
+
+		// Reconstruct the thin race window: the evicted client A's target set
+		// still contains the re-homed target (as if A's deferred cleanup began
+		// before addTarget dropped it). A's deleteTarget must be a no-op for a
+		// target it no longer owns — it must neither delete B's map entry nor
+		// fire DeleteTargetHandler (which would cancel B's fresh session).
+		s.clients[addrA].targets[key] = struct{}{}
+		if err := s.deleteTarget(addrA, tgt, false); err != nil {
+			t.Fatalf("deleteTarget(A) got %v, want no-op success", err)
+		}
+		if got := s.clientFromTarget(key); got != net.Addr(addrB) {
+			t.Errorf("owner = %v, want B unchanged (%v)", got, addrB)
+		}
+		if len(*events) != 0 {
+			t.Errorf("stale-owner cleanup fired handlers %v, want none", *events)
+		}
+	})
+}
+
 func TestServerRegister(t *testing.T) {
 	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:45000")
 	if err != nil {
