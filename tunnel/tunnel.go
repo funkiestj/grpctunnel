@@ -339,18 +339,23 @@ func (s *Server) clientInfo(addr net.Addr) clientRegInfo {
 
 // clientTargets returns all the targets of a given client. If addr is nil, return all the targets.
 func (s *Server) clientTargets(addr net.Addr) map[Target]struct{} {
-	s.cmu.RLock()
-	defer s.cmu.RUnlock()
 	// Make a deep copy.
 	targets := make(map[Target]struct{})
 
+	// The nil case reads the global target map (rTargets), which is guarded by
+	// tmu — not cmu. Reading it under cmu is the wrong lock and races with
+	// addTargetToMap/deleteTargetFromMap.
 	if addr == nil {
+		s.tmu.RLock()
+		defer s.tmu.RUnlock()
 		for t := range s.rTargets {
 			targets[t] = struct{}{}
 		}
 		return targets
 	}
 
+	s.cmu.RLock()
+	defer s.cmu.RUnlock()
 	info, ok := s.clients[addr]
 	if !ok {
 		return nil
@@ -383,19 +388,39 @@ func (s *Server) addClient(addr net.Addr, rs regStream) error {
 
 // deleteClient removes a client from the clients map, and delete the corresponding targets from the targets map.
 func (s *Server) deleteClient(addr net.Addr) {
+	// Snapshot the remaining targets under cmu, then release it before calling
+	// deleteTarget — deleteTarget re-locks cmu (via clientInfo), so holding cmu
+	// across it self-deadlocks and wedges cmu server-wide. In normal operation
+	// deleteTargets has already emptied the set, so this loop is usually a no-op;
+	// it is a backstop for any target still recorded here.
 	s.cmu.Lock()
-	defer s.cmu.Unlock()
 	clientInfo, ok := s.clients[addr]
 	if !ok {
+		s.cmu.Unlock()
 		return
 	}
-
+	remaining := make([]Target, 0, len(clientInfo.targets))
 	for t := range clientInfo.targets {
+		remaining = append(remaining, t)
+	}
+	s.cmu.Unlock()
+
+	for _, t := range remaining {
 		target := tpb.Target{Target: t.ID, TargetType: t.Type}
 		s.deleteTarget(addr, &target, false)
 	}
 
+	s.cmu.Lock()
 	delete(s.clients, addr)
+	s.cmu.Unlock()
+
+	// Subscription state is per-client and must be cleaned up on client teardown,
+	// not target teardown: an evicted client's targets are removed before it
+	// disconnects, so the deleteTarget path never reaches its subscriber entry.
+	// Cleared directly under smu (s.sub is smu-protected).
+	s.smu.Lock()
+	delete(s.sub, addr)
+	s.smu.Unlock()
 }
 
 // errorTargetRegisterOp returns a RegisterOp message of the form Registration with error.
@@ -449,19 +474,55 @@ func (s *Server) deleteTargetFromMap(addr net.Addr, t Target) (owned bool, err e
 }
 
 // addTargetToClient adds a target to the clients map.
-func (s *Server) addTargetToClient(addr net.Addr, t Target) {
+// addTargetToClient records t in addr's client set, but only if addr still owns
+// t in rTargets. Holding cmu then tmu makes the ownership check and the record
+// atomic with respect to eviction: a client that clean-added t in rTargets and
+// was then evicted before reaching here must not strand t in its own set. The
+// lock order is cmu -> tmu; no path takes tmu then cmu, so this is deadlock-free.
+// Returns whether it recorded the target.
+func (s *Server) addTargetToClient(addr net.Addr, t Target) bool {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
-	// Already checked its entry does exists.
+	s.tmu.RLock()
+	owned := s.rTargets[t] == addr
+	s.tmu.RUnlock()
+	if !owned {
+		return false
+	}
+	// The client entry existence was checked by the caller.
 	s.clients[addr].targets[t] = struct{}{}
+	return true
 }
 
-// deleteTargetFromClient deletes a target to the clients map.
-func (s *Server) deleteTargetFromClient(addr net.Addr, t Target) {
+// clientHasTarget reports whether addr's client set contains t, read under cmu.
+// The per-client target set is a shared map; reading it via a clientInfo copy
+// without the lock races with concurrent addTargetToClient/deleteTargetFromClient.
+func (s *Server) clientHasTarget(addr net.Addr, t Target) bool {
+	s.cmu.RLock()
+	defer s.cmu.RUnlock()
+	info, ok := s.clients[addr]
+	if !ok {
+		return false
+	}
+	_, ok = info.targets[t]
+	return ok
+}
+
+// deleteTargetFromClient removes t from addr's client set and reports whether it
+// was actually present (so callers can distinguish a real registration from a
+// provisional owner that was visible in rTargets but never recorded).
+func (s *Server) deleteTargetFromClient(addr net.Addr, t Target) bool {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
-	// Already checked its entry exists.
-	delete(s.clients[addr].targets, t)
+	info, ok := s.clients[addr]
+	if !ok {
+		return false
+	}
+	if _, ok := info.targets[t]; !ok {
+		return false
+	}
+	delete(info.targets, t)
+	return true
 }
 
 // addTarget registers a target for a given client. It registers
@@ -499,17 +560,16 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		return err
 	}
 	if evicted != nil {
-		// PrivilegeNewestRegistration: this target was still owned by another
-		// client whose registration is stale (e.g. a half-open Register stream
-		// left by a device reload). Ownership has already transferred to addr;
-		// drop the target from the stale client and tear down its handler-side
-		// session before standing up the new one, so the new registration is not
-		// shadowed by the old target's lingering session. We never touch the
-		// stale client's Register stream — it may be a blocked zombie — so its
-		// own deferred cleanup runs later and finds the target already gone
-		// (and, being a non-owner by then, a no-op via deleteTargetFromMap).
-		s.deleteTargetFromClient(evicted, t)
-		if s.sc.DeleteTargetHandler != nil {
+		// PrivilegeNewestRegistration: t was owned by another client whose
+		// registration is stale (e.g. a half-open Register stream left by a device
+		// reload). Ownership has already transferred to addr; drop t from the
+		// stale client and, only if that client had actually recorded it, tear
+		// down its handler-side session — a provisional owner that claimed t in
+		// rTargets but never recorded it has no handler state to tear down. We
+		// never touch the stale client's Register stream (it may be a blocked
+		// zombie); its own deferred cleanup runs later and finds t already gone
+		// (a no-op via the owner-aware deleteTargetFromMap).
+		if s.deleteTargetFromClient(evicted, t) && s.sc.DeleteTargetHandler != nil {
 			if err := s.sc.DeleteTargetHandler(t); err != nil {
 				s.sendError(fmt.Errorf("evicting target %q held by stale client %q: delete handler failed: %v", t.ID, evicted, err))
 			}
@@ -517,7 +577,40 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		s.sendError(fmt.Errorf("target %q re-registered by %q evicted stale registration held by %q", t.ID, addr, evicted))
 	}
 
-	s.addTargetToClient(addr, t)
+	// Record t in addr's client set, but only if addr still owns it. If a newer
+	// registration evicted addr between the addTargetToMap claim above and here,
+	// addTargetToClient returns false and we abandon this registration without
+	// standing anything up — the newest registration wins.
+	if !s.addTargetToClient(addr, t) {
+		return fmt.Errorf("target %q re-homed to a newer registration during setup", t.ID)
+	}
+
+	// Announce the target only on a fresh registration. On an eviction the
+	// target-name stayed continuously present (it only moved tunnels), so a
+	// second ADD with no intervening REMOVE would double-notify subscribers;
+	// suppress it (announce == false).
+	return s.finishAddTarget(addr, rs, target, t, evicted == nil)
+}
+
+// finishAddTarget performs the post-record steps of a registration: a
+// best-effort ownership recheck, then the accept ack, AddTargetHandler, and
+// (when announce is set) the subscriber ADD broadcast. It is split from
+// addTarget so that (a) the eviction-race tests can drive the record and the
+// side effects around a barrier without a production hook, and (b) a client
+// evicted after recording itself but before these side effects does not fire
+// them as a non-owner.
+//
+// The recheck is best-effort: handlers and stream sends run outside the locks,
+// so a residual window remains between the check and the side effect. A hard
+// guarantee would require target-level serialization; for this fork and its
+// consumer (which keeps an owner-aware session map) best-effort is sufficient.
+func (s *Server) finishAddTarget(addr net.Addr, rs regStream, target *tpb.Target, t Target, announce bool) error {
+	if s.clientFromTarget(t) != addr {
+		// Evicted after we recorded t: undo the record and bail rather than fire
+		// stale side effects for a target we no longer own.
+		s.deleteTargetFromClient(addr, t)
+		return fmt.Errorf("target %q re-homed to a newer registration during setup", t.ID)
+	}
 
 	if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{
 		Target:     target.Target,
@@ -533,8 +626,10 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		}
 	}
 
-	if err := s.sendUpdates(t, true); err != nil {
-		return fmt.Errorf("failed to send target subscription updates: %v", err)
+	if announce {
+		if err := s.sendUpdates(t, true); err != nil {
+			return fmt.Errorf("failed to send target subscription updates: %v", err)
+		}
 	}
 
 	return nil
@@ -731,7 +826,7 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 	rs := clientInfo.rs
 	t := Target{ID: target.Target, Type: target.TargetType}
 
-	if _, ok := clientInfo.targets[t]; !ok {
+	if !s.clientHasTarget(addr, t) {
 		err := fmt.Errorf("target %q is not registered in s.clients", t)
 		if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 			return fmt.Errorf("failed to send session error: %v", err)
@@ -740,6 +835,10 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 	}
 
 	owned, err := s.deleteTargetFromMap(addr, t)
+	// Always prune addr's own client-set entry, even when the map reports the
+	// target !ok (re-homed to a newer owner, or already gone). Leaving it
+	// recorded is what lets a stranded entry wedge deleteClient's cleanup.
+	s.deleteTargetFromClient(addr, t)
 	if err != nil {
 		if ack {
 			if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
@@ -749,7 +848,6 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 		return err
 	}
 
-	s.deleteTargetFromClient(addr, t)
 	if ack {
 		if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{
 			Target:     target.Target,
@@ -770,7 +868,10 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 			return fmt.Errorf("error calling target deletion handler client: %v", err)
 		}
 	}
-	s.deleteSubscriber(addr, "")
+	// Subscription cleanup is NOT done here: a subscriber that unregisters one
+	// target should keep its subscription, and an evicted client's targets are
+	// gone before it disconnects. Per-client subscriber state is cleared in
+	// deleteClient, the correct ownership boundary.
 	if owned {
 		if err := s.sendUpdates(t, false); err != nil {
 			return fmt.Errorf("failed to send target subscription updates: %v", err)
