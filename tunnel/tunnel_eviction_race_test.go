@@ -83,7 +83,7 @@ func TestEvictionAfterRecordSkipsStaleSideEffects(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ev, err := s.addTargetToMap(victim, key)
+		ev, _, err := s.addTargetToMap(victim, key)
 		if err != nil || ev != nil {
 			t.Errorf("victim addTargetToMap: evicted=%v err=%v, want clean add", ev, err)
 		}
@@ -289,7 +289,9 @@ func TestEvictionDeleteHandlerFailureBestEffort(t *testing.T) {
 	errs := make(chan error, 8)
 	drainDone := make(chan struct{})
 	defer close(drainDone)
+	ready := make(chan struct{})
 	go func() {
+		close(ready)
 		for {
 			select {
 			case e := <-s.ErrorChan():
@@ -302,7 +304,11 @@ func TestEvictionDeleteHandlerFailureBestEffort(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(50 * time.Millisecond) // let the drainer park on ErrorChan
+	// Ensure the drainer has entered its receive loop before we trigger the
+	// eviction (sendError is non-blocking on an unbuffered channel). There is
+	// still a full addTarget(a) below before any sendError fires, so the drainer
+	// is reliably parked by then.
+	<-ready
 
 	if err := s.addTarget(a, tgt); err != nil {
 		t.Fatalf("addTarget a: %v", err)
@@ -374,4 +380,91 @@ func TestClientTargetsNilLockRace(t *testing.T) {
 	}
 	wg.Wait()
 	close(done)
+}
+
+// 9. (Codex 14:55 review) The eviction delete-handler decision must be captured
+// atomically with the ownership transfer — addTargetToMap removes the evicted
+// owner's client-set entry and reports whether it had recorded the target. A
+// fully-registered owner reports true; a provisional owner (claimed rTargets but
+// never recorded via addTargetToClient) reports false.
+func TestAddTargetToMapCapturesEvictedHadTarget(t *testing.T) {
+	a := mustResolve(t, "127.0.0.1:45360")
+	b := mustResolve(t, "127.0.0.1:45361")
+	c := mustResolve(t, "127.0.0.1:45362")
+	key, tgt := evictionTestKey()
+	s, err := NewServer(ServerConfig{PrivilegeNewestRegistration: true})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	for _, ad := range []net.Addr{a, b, c} {
+		if err := s.addClient(ad, newConcurrentClientStream()); err != nil {
+			t.Fatalf("addClient: %v", err)
+		}
+	}
+
+	if err := s.addTarget(a, tgt); err != nil { // A fully registers (records T)
+		t.Fatalf("addTarget a: %v", err)
+	}
+	// Evicting a fully-registered owner: evictedHadTarget == true, entry removed.
+	ev, had, err := s.addTargetToMap(b, key)
+	if ev != a || !had || err != nil {
+		t.Fatalf("addTargetToMap(b) = (%v, %v, %v), want (a, true, nil)", ev, had, err)
+	}
+	if s.clientHasTarget(a, key) {
+		t.Error("evicted owner's client-set entry was not removed atomically")
+	}
+	// B is now only a provisional owner (claimed rTargets, never recorded).
+	// Evicting a provisional owner: evictedHadTarget == false.
+	ev2, had2, err2 := s.addTargetToMap(c, key)
+	if ev2 != b || had2 || err2 != nil {
+		t.Fatalf("addTargetToMap(c) = (%v, %v, %v), want (b, false, nil)", ev2, had2, err2)
+	}
+}
+
+// 10. (Codex 14:55 review) DeleteTargetHandler for an evicted, fully-registered
+// owner must run exactly once even when the stale owner's own cleanup lands
+// between the ownership transfer and the eviction teardown. This drives that
+// interleaving DETERMINISTICALLY (a random concurrent race almost never hits the
+// window). The pre-fix code decided the delete-handler by whoever won the race
+// to prune the client set, which leaked (delCount=0); the fix captures the fact
+// in addTargetToMap so handleEviction runs it exactly once regardless.
+func TestEvictionDeleteHandlerExactlyOnceUnderStaleCleanup(t *testing.T) {
+	a := mustResolve(t, "127.0.0.1:45363")
+	b := mustResolve(t, "127.0.0.1:45364")
+	key, tgt := evictionTestKey()
+	var delCount int32
+	s, err := NewServer(ServerConfig{
+		PrivilegeNewestRegistration: true,
+		AddTargetHandler:            func(Target) error { return nil },
+		DeleteTargetHandler:         func(Target) error { atomic.AddInt32(&delCount, 1); return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := s.addClient(a, newConcurrentClientStream()); err != nil {
+		t.Fatalf("addClient a: %v", err)
+	}
+	if err := s.addClient(b, newConcurrentClientStream()); err != nil {
+		t.Fatalf("addClient b: %v", err)
+	}
+	if err := s.addTarget(a, tgt); err != nil { // A fully registered; has handler state
+		t.Fatalf("addTarget a: %v", err)
+	}
+
+	// B transfers ownership (addTargetToMap atomically removes A's entry and
+	// captures that A had recorded it).
+	evicted, evictedHad, err := s.addTargetToMap(b, key)
+	if err != nil || evicted != a {
+		t.Fatalf("addTargetToMap(b) = (%v, %v, %v), want (a, _, nil)", evicted, evictedHad, err)
+	}
+	// A's stale cleanup lands HERE — before B's teardown. It must not be what
+	// decides the delete-handler (A's entry is already gone, so this is a no-op
+	// that takes the owned==false path).
+	_ = s.deleteTarget(a, tgt, false)
+	// B runs the eviction teardown based on the captured fact.
+	s.handleEviction(b, evicted, evictedHad, key)
+
+	if n := atomic.LoadInt32(&delCount); n != 1 {
+		t.Fatalf("DeleteTargetHandler ran %d times, want exactly 1 (delCount=0 is the leak)", n)
+	}
 }

@@ -120,7 +120,7 @@ func TestPrivilegeNewestRegistrationEvictionStrandDeadlock(t *testing.T) {
 
 	go func() {
 		// Victim claims the target in the ownership map (clean add)...
-		evicted, err := s.addTargetToMap(victim, key)
+		evicted, _, err := s.addTargetToMap(victim, key)
 		if err != nil || evicted != nil {
 			t.Errorf("victim addTargetToMap: evicted=%v err=%v, want clean add", evicted, err)
 		}

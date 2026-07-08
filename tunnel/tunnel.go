@@ -433,21 +433,38 @@ func errorTargetRegisterOp(id, typ, err string) *tpb.RegisterOp {
 // is transferred to addr and the evicted previous owner is returned so the
 // caller can tear down its stale registration; otherwise a duplicate is
 // rejected as before. evicted is nil for a clean add.
-func (s *Server) addTargetToMap(addr net.Addr, t Target) (evicted net.Addr, err error) {
+func (s *Server) addTargetToMap(addr net.Addr, t Target) (evicted net.Addr, evictedHadTarget bool, err error) {
+	// cmu (outer) then tmu (inner) — the same order as addTargetToClient, and no
+	// path takes tmu then cmu, so this is deadlock-free. Holding both lets the
+	// ownership transfer and the removal-of/decision-about the evicted owner's
+	// client-set entry happen atomically, so a stale owner's concurrent cleanup
+	// cannot change whether we run its DeleteTargetHandler.
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	if c, ok := s.rTargets[t]; ok {
-		if c == addr || !s.sc.PrivilegeNewestRegistration {
-			return nil, fmt.Errorf("target %q already registered for client %q", t.ID, c)
-		}
-		// Privilege the newest registration: take ownership from the stale
-		// client and report it so the caller can evict it.
+	c, ok := s.rTargets[t]
+	if !ok {
 		s.rTargets[t] = addr
-		return c, nil
+		return nil, false, nil
 	}
+	if c == addr || !s.sc.PrivilegeNewestRegistration {
+		return nil, false, fmt.Errorf("target %q already registered for client %q", t.ID, c)
+	}
+	// Privilege the newest registration: take ownership from the stale client,
+	// and atomically remove t from its client set while capturing whether it had
+	// actually recorded t (i.e. completed registration). The caller runs the
+	// stale owner's DeleteTargetHandler based on this captured fact, exactly once,
+	// regardless of the stale owner's own concurrent cleanup.
 	s.rTargets[t] = addr
-	return nil, nil
+	if info, ok := s.clients[c]; ok {
+		if _, ok := info.targets[t]; ok {
+			delete(info.targets, t)
+			evictedHadTarget = true
+		}
+	}
+	return c, evictedHadTarget, nil
 }
 
 // deleteTargetFromMap deletes a target from the targets map, but only if it is
@@ -525,6 +542,22 @@ func (s *Server) deleteTargetFromClient(addr net.Addr, t Target) bool {
 	return true
 }
 
+// handleEviction runs the teardown for a stale owner (evicted) that lost target
+// t to addr's registration. It fires DeleteTargetHandler iff the evicted owner
+// had actually recorded t — evictedHad is captured atomically with the ownership
+// transfer by addTargetToMap, so this decision is race-free with respect to the
+// evicted owner's own concurrent cleanup (a provisional owner that claimed t in
+// rTargets but never recorded it has no handler state to tear down). It never
+// touches the evicted client's Register stream (it may be a blocked zombie).
+func (s *Server) handleEviction(addr, evicted net.Addr, evictedHad bool, t Target) {
+	if evictedHad && s.sc.DeleteTargetHandler != nil {
+		if err := s.sc.DeleteTargetHandler(t); err != nil {
+			s.sendError(fmt.Errorf("evicting target %q held by stale client %q: delete handler failed: %v", t.ID, evicted, err))
+		}
+	}
+	s.sendError(fmt.Errorf("target %q re-registered by %q evicted stale registration held by %q", t.ID, addr, evicted))
+}
+
 // addTarget registers a target for a given client. It registers
 // is in the clients map and targets map.
 func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
@@ -552,7 +585,7 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		return err
 	}
 
-	evicted, err := s.addTargetToMap(addr, t)
+	evicted, evictedHad, err := s.addTargetToMap(addr, t)
 	if err != nil {
 		if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 			return fmt.Errorf("failed to send session error: %v", err)
@@ -560,21 +593,7 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		return err
 	}
 	if evicted != nil {
-		// PrivilegeNewestRegistration: t was owned by another client whose
-		// registration is stale (e.g. a half-open Register stream left by a device
-		// reload). Ownership has already transferred to addr; drop t from the
-		// stale client and, only if that client had actually recorded it, tear
-		// down its handler-side session — a provisional owner that claimed t in
-		// rTargets but never recorded it has no handler state to tear down. We
-		// never touch the stale client's Register stream (it may be a blocked
-		// zombie); its own deferred cleanup runs later and finds t already gone
-		// (a no-op via the owner-aware deleteTargetFromMap).
-		if s.deleteTargetFromClient(evicted, t) && s.sc.DeleteTargetHandler != nil {
-			if err := s.sc.DeleteTargetHandler(t); err != nil {
-				s.sendError(fmt.Errorf("evicting target %q held by stale client %q: delete handler failed: %v", t.ID, evicted, err))
-			}
-		}
-		s.sendError(fmt.Errorf("target %q re-registered by %q evicted stale registration held by %q", t.ID, addr, evicted))
+		s.handleEviction(addr, evicted, evictedHad, t)
 	}
 
 	// Record t in addr's client set, but only if addr still owns it. If a newer
