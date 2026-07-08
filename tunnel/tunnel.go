@@ -1325,6 +1325,17 @@ func (c *Client) Error() error {
 	return c.err
 }
 
+// recordErr stores err as the client's error if none is recorded yet, without
+// cancelling. Used by a spurious concurrent Start so it can report the
+// "already running" error without tearing down the instance that is running.
+func (c *Client) recordErr(err error) {
+	c.emu.Lock()
+	defer c.emu.Unlock()
+	if c.err == nil {
+		c.err = err
+	}
+}
+
 // NewClient creates a new tunnel client.
 func NewClient(tc tpb.TunnelClient, cc ClientConfig, ts map[Target]struct{}) (*Client, error) {
 	if (cc.RegisterHandler == nil) != (cc.Handler == nil) {
@@ -1423,20 +1434,24 @@ func (c *Client) Run(ctx context.Context) error {
 
 // Start handles received register stream requests.
 func (c *Client) Start(ctx context.Context) {
+	select {
+	case c.block <- struct{}{}:
+	default:
+		// A Start is already running. Record the error but do NOT cancel the
+		// running instance: a spurious concurrent Start must not tear down the
+		// client that is actually running (doing so also raced any observer of
+		// Error()).
+		c.recordErr(errors.New("client is already running"))
+		return
+	}
+
 	var err error
 	defer func() {
 		c.cancel(err)
 	}()
-
-	select {
-	case c.block <- struct{}{}:
-		defer func() {
-			<-c.block
-		}()
-	default:
-		err = errors.New("client is already running")
-		return
-	}
+	defer func() {
+		<-c.block
+	}()
 
 	for {
 		var reg *tpb.RegisterOp
